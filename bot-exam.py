@@ -26,19 +26,23 @@ DEFAULT_MODEL = 'openai/gpt-oss-120b'
 # Константы
 USER_STATS_FILE = "user_stats.json"
 USER_MESSAGES_FILE = "user_messages.json"
-ANSWERS_FILE = "answers_python.json"
 EXAM_STATE_FILE = "exam_states.json"
+USER_QUESTION_STATS_FILE = "user_question_stats.json"
 MAX_CONTEXT_LENGTH = 3000
 
 # Конфигурация тем экзамена
 EXAM_TOPICS = {
-    "Питон": {
+    "python": {
         "questions_file": "answers_python.json",
-        "display_name": "📱 Информатика"
+        "display_name": "Питончик 🐍"
     },
     "Текст": {
-        "questions_file": "answers_math.json", 
-        "display_name": "🔢 текст"
+        "questions_file": "answers_graph.json", 
+        "display_name": "текст 🔢"
+    },
+    "clash royale": {
+        "questions_file": "answers_royale.json", 
+        "display_name": "Клещ рояль 🐞"
     }
 }
 
@@ -48,6 +52,7 @@ user_messages = {}
 user_stats = {}
 answers_data = {}
 user_exam_state = {}
+user_question_stats = {}
 
 # ======================== УТИЛИТЫ ========================
 
@@ -105,6 +110,29 @@ def send_message_safe(chat_id, text, markup=None):
     except Exception:
         bot.send_message(chat_id, text, reply_markup=markup)
 
+def parse_ai_score(ai_response):
+    """
+    Извлекает процент оценки из ответа ИИ
+    Ищет паттерн: "Оценка: XX%"
+    Возвращает число 0-100 или None при ошибке
+    """
+    # Основной паттерн: "Оценка: XX%"
+    match = re.search(r"Оценка:\s*(\d{1,3})%", ai_response, re.IGNORECASE)
+    if match:
+        score = int(match.group(1))
+        # Проверяем валидность (0-100%)
+        if 0 <= score <= 100:
+            return score
+    
+    # Запасной паттерн: просто "XX%" в начале строки
+    match = re.search(r"^(\d{1,3})%", ai_response.strip())
+    if match:
+        score = int(match.group(1))
+        if 0 <= score <= 100:
+            return score
+            
+    return None
+
 # ======================== КЛАВИАТУРЫ ========================
 
 def get_main_keyboard():
@@ -145,13 +173,82 @@ def initialize_user(user_id, user_data):
 
 def load_all_data():
     """Загрузка всех данных при старте"""
-    global user_messages, user_stats, answers_data, user_exam_state
+    global user_messages, user_stats, answers_data, user_exam_state, user_question_stats
     user_messages = load_data(USER_MESSAGES_FILE)
     user_stats = load_data(USER_STATS_FILE)
-    answers_data = load_data(ANSWERS_FILE)
     user_exam_state = load_data(EXAM_STATE_FILE)
+    user_question_stats = load_data(USER_QUESTION_STATS_FILE)
 
 # ======================== ЭКЗАМЕН ========================
+
+import hashlib
+
+def get_question_hash(question_text):
+    """Создает уникальный хеш для вопроса"""
+    return hashlib.md5(question_text.encode('utf-8')).hexdigest()[:12]
+
+def add_score_to_question(user_id, topic_key, question_text, score, max_history=5):
+    """Добавляет оценку к вопросу пользователя"""
+    user_id_str = str(user_id)
+    question_hash = get_question_hash(question_text)
+    
+    # Инициализируем структуру если нужно
+    if user_id_str not in user_question_stats:
+        user_question_stats[user_id_str] = {}
+    if topic_key not in user_question_stats[user_id_str]:
+        user_question_stats[user_id_str][topic_key] = {}
+    
+    # Получаем текущий список оценок
+    scores_list = user_question_stats[user_id_str][topic_key].get(question_hash, [])
+    
+    # Добавляем новую оценку
+    scores_list.append(score)
+    
+    # Ограничиваем размер истории
+    if len(scores_list) > max_history:
+        scores_list.pop(0)
+    
+    # Сохраняем
+    user_question_stats[user_id_str][topic_key][question_hash] = scores_list
+    save_data(USER_QUESTION_STATS_FILE, user_question_stats)
+
+def get_average_score(user_id, topic_key, question_text):
+    """Получает средний балл пользователя по вопросу"""
+    user_id_str = str(user_id)
+    question_hash = get_question_hash(question_text)
+    
+    if (user_id_str in user_question_stats and 
+        topic_key in user_question_stats[user_id_str] and
+        question_hash in user_question_stats[user_id_str][topic_key]):
+        
+        scores = user_question_stats[user_id_str][topic_key][question_hash]
+        return sum(scores) / len(scores) if scores else 0
+    
+    return 0  # Новый вопрос
+
+def select_adaptive_question(user_id, topic_key, available_questions):
+    """Выбирает вопрос на основе статистики пользователя"""
+    user_id_str = str(user_id)
+    
+    # Собираем веса для всех вопросов
+    weights = []
+    questions = list(available_questions.keys())
+    
+    for question in questions:
+        avg_score = get_average_score(user_id, topic_key, question)
+        
+        # Формула: чем ниже средний балл, тем выше вес
+        # Коэффициент 2.0 усиливает разницу
+        weight = (100 - avg_score) ** 2.0
+        weight = max(weight, 1)  # Минимальный вес = 1
+        
+        weights.append(weight)
+    
+    # Выбираем с учетом весов
+    import random
+    selected_question = random.choices(questions, weights=weights, k=1)[0]
+    
+    return selected_question
 
 def get_topics_keyboard():
     """Клавиатура для выбора темы экзамена"""
@@ -208,8 +305,9 @@ def process_exam_answer(user_id, chat_id, user_answer):
     """Обработка ответа на экзамен"""
     user_id_str = str(user_id)
     question = user_exam_state[user_id_str]["question"]
+    topic_key = user_exam_state[user_id_str]["topic"]
     
-    # Берем правильный ответ из сохраненных вопросов пользователя
+    # Получаем правильный ответ
     user_questions = get_user_questions(user_id)
     correct_answer = user_questions.get(question, "")
     
@@ -228,7 +326,7 @@ def process_exam_answer(user_id, chat_id, user_answer):
         f"Вопрос: {question}\n"
         f"Эталонный ответ (образец): {correct_answer}\n"
         f"Ответ пользователя: {user_answer}\n\n"
-        f"Оцени, насколько ответ пользователя совпадает с эталонным (от 0% до 100%). "
+        f"Оцени, насколько ответ пользователя совпадает с эталонным (от 0% до 100%). Не будь слишком строгим."
         f"Кратко укажи, взяв из эталона, чего не хватает в ответе пользователя, а что хорошо.\n"
         f"Формат ответа:\nОценка: <проценты>%\nРекомендация: <текст>"
     )
@@ -240,6 +338,14 @@ def process_exam_answer(user_id, chat_id, user_answer):
         )
         response = chat_completion.choices[0].message.content
         response = remove_think_blocks(response)
+
+        # 👈 НОВОЕ: Парсим оценку и сохраняем статистику
+        score = parse_ai_score(response)
+        if score is not None:
+            add_score_to_question(user_id, topic_key, question, score)
+            logger.info(f"Saved score {score} for user {user_id}, question: {question[:50]}...")
+        else:
+            logger.warning(f"Failed to parse score from AI response: {response[:100]}...")
         
         # Отправляем оценку и показываем клавиатуру экзамена
         send_message_safe(chat_id, f"📝 Результат:\n\n{response}", get_exam_keyboard())
@@ -273,6 +379,9 @@ def show_theory(user_id, chat_id):
     )
     
     try:
+        # Сообщаем пользователю, что идёт формирование теории
+        thinking_message = bot.send_message(chat_id, '🤔 Думаю над теорией...')
+
         theory_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": theory_prompt}],
             model=user_stats[user_id_str].get("model", DEFAULT_MODEL),
@@ -280,16 +389,40 @@ def show_theory(user_id, chat_id):
         theory = theory_completion.choices[0].message.content
         theory = remove_think_blocks(theory)
         
-        # Отправляем теорию частями
-        for part in split_message(theory):
-            send_message_safe(chat_id, part)
+        # Отправляем теорию частями, первую часть подставляем в сообщение "думаю"
+        message_parts = split_message(theory)
+        if message_parts:
+            try:
+                bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=thinking_message.message_id,
+                    text=message_parts[0],
+                    parse_mode='Markdown'
+                )
+            except:
+                bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=thinking_message.message_id,
+                    text=message_parts[0]
+                )
+            for part in message_parts[1:]:
+                send_message_safe(chat_id, part)
             
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Ошибка при формировании теории: {e}")
+        # Пытаемся заменить сообщение "думаю" на ошибку, если оно было отправлено
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=thinking_message.message_id,
+                text=f"❌ Ошибка при формировании теории: {e}"
+            )
+        except:
+            bot.send_message(chat_id, f"❌ Ошибка при формировании теории: {e}")
 
 def next_question(user_id, chat_id):
     """Следующий вопрос"""
     user_id_str = str(user_id)
+    topic_key = user_exam_state[user_id_str]["topic"]
     
     # Берем вопросы из состояния пользователя
     user_questions = get_user_questions(user_id)
@@ -297,7 +430,7 @@ def next_question(user_id, chat_id):
         bot.send_message(chat_id, "❌ Ошибка: Нет доступных вопросов.")
         return
     
-    question = random.choice(list(user_questions.keys()))
+    question = select_adaptive_question(user_id, topic_key, user_questions)
     topic_display = user_exam_state[user_id_str]["topic_display"]
     
     # Обновляем состояние
