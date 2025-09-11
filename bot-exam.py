@@ -1,0 +1,500 @@
+import telebot
+from telebot.types import Message, BotCommand
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton
+from telebot import types
+from config import TOKEN_TG, TOKEN_AI
+from groq import Groq
+import os
+import json
+import logging
+import random
+import re
+import time
+
+# Настройка логирования
+logging.basicConfig(level=logging.ERROR)
+for logger_name in ("httpx", "telebot"):
+    logging.getLogger(logger_name).setLevel(logging.ERROR)
+
+logger = logging.getLogger(__name__)
+
+# Инициализация
+bot = telebot.TeleBot(TOKEN_TG)
+client = Groq(api_key=TOKEN_AI)
+DEFAULT_MODEL = 'openai/gpt-oss-120b'
+
+# Константы
+USER_STATS_FILE = "user_stats.json"
+USER_MESSAGES_FILE = "user_messages.json"
+ANSWERS_FILE = "answers_python.json"
+EXAM_STATE_FILE = "exam_states.json"
+MAX_CONTEXT_LENGTH = 3000
+
+# Глобальные переменные
+user_messages = {}
+user_stats = {}
+answers_data = {}
+user_exam_state = {}
+
+# ======================== УТИЛИТЫ ========================
+
+def load_data(filename):
+    """Загрузка данных из JSON файла"""
+    if os.path.exists(filename):
+        with open(filename, "r", encoding='utf-8') as file:
+            return json.load(file)
+    return {}
+
+def save_data(filename, data):
+    """Сохранение данных в JSON файл"""
+    with open(filename, "w", encoding='utf-8') as file:
+        json.dump(data, file, ensure_ascii=False, indent=4)
+
+def save_exam_state():
+    """Сохранение состояний экзамена"""
+    save_data(EXAM_STATE_FILE, user_exam_state)
+
+def split_message(text, max_length=4096):
+    """Разбивка длинного сообщения на части"""
+    return [text[i:i + max_length] for i in range(0, len(text), max_length)]
+
+def trim_context(context):
+    """Обрезка контекста до лимита"""
+    current_length = sum(len(msg["content"]) for msg in context)
+    while current_length > MAX_CONTEXT_LENGTH and context:
+        context.pop(0)
+        current_length = sum(len(msg["content"]) for msg in context)
+    return context
+
+def remove_think_blocks(text):
+    """Удаление блоков размышлений модели"""
+    return re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
+
+def send_message_safe(chat_id, text, markup=None):
+    """Безопасная отправка сообщения"""
+    try:
+        bot.send_message(chat_id, text, parse_mode='Markdown', reply_markup=markup)
+    except Exception:
+        bot.send_message(chat_id, text, reply_markup=markup)
+
+# ======================== КЛАВИАТУРЫ ========================
+
+def get_main_keyboard():
+    """Основная клавиатура"""
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.row(KeyboardButton("📚 Начать экзамен"))
+    keyboard.row(KeyboardButton("📊 Статистика"), KeyboardButton("🗑 Очистить историю"))
+    return keyboard
+
+def get_exam_keyboard():
+    """Клавиатура для экзамена"""
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.row(KeyboardButton("📖 Показать теорию"))
+    keyboard.row(KeyboardButton("⏭️ Следующий вопрос"), KeyboardButton("❌ Завершить экзамен"))
+    return keyboard
+
+def get_hidden_keyboard():
+    """Скрытая клавиатура"""
+    return types.ReplyKeyboardRemove()
+
+# ======================== ИНИЦИАЛИЗАЦИЯ ========================
+
+def initialize_user(user_id, user_data):
+    """Инициализация пользователя"""
+    user_id_str = str(user_id)
+    if user_id_str not in user_stats:
+        user_stats[user_id_str] = {
+            "username": user_data.get('username', 'Unknown'),
+            "text_requests": 0,
+            "voice_requests": 0,
+            "model": DEFAULT_MODEL,
+            "exam_answered": 0
+        }
+        save_data(USER_STATS_FILE, user_stats)
+    
+    if user_id_str not in user_messages:
+        user_messages[user_id_str] = []
+
+def load_all_data():
+    """Загрузка всех данных при старте"""
+    global user_messages, user_stats, answers_data, user_exam_state
+    user_messages = load_data(USER_MESSAGES_FILE)
+    user_stats = load_data(USER_STATS_FILE)
+    answers_data = load_data(ANSWERS_FILE)
+    user_exam_state = load_data(EXAM_STATE_FILE)
+
+# ======================== ЭКЗАМЕН ========================
+
+def start_exam(user_id, chat_id):
+    """Начало экзамена"""
+    user_id_str = str(user_id)
+    
+    if not answers_data:
+        bot.send_message(chat_id, "❌ База вопросов пуста или не загружена.")
+        return
+    
+    question = random.choice(list(answers_data.keys()))
+    user_exam_state[user_id_str] = {
+        "question": question,
+        "waiting_answer": True,
+        "start_time": time.time()
+    }
+    save_exam_state()
+    
+    bot.send_message(
+        chat_id,
+        f"🎯 Экзамен начат!\n\nВопрос:\n{question}\n\n💬 Введите ваш ответ:",
+        reply_markup=get_hidden_keyboard()
+    )
+
+def process_exam_answer(user_id, chat_id, user_answer):
+    """Обработка ответа на экзамен"""
+    user_id_str = str(user_id)
+    question = user_exam_state[user_id_str]["question"]
+    correct_answer = answers_data.get(question, "")
+    
+    # Меняем состояние
+    user_exam_state[user_id_str]["waiting_answer"] = False
+    user_exam_state[user_id_str]["waiting_action"] = True
+    save_exam_state()
+    
+    # Увеличиваем счетчик
+    user_stats[user_id_str]["exam_answered"] = user_stats[user_id_str].get("exam_answered", 0) + 1
+    save_data(USER_STATS_FILE, user_stats)
+    
+    # Оценка ответа
+    prompt = (
+        f"Вопрос: {question}\n"
+        f"Эталонный ответ (образец): {correct_answer}\n"
+        f"Ответ пользователя: {user_answer}\n\n"
+        f"Оцени, насколько ответ пользователя совпадает с эталонным (от 0% до 100%). "
+        f"Кратко укажи, взяв из эталона, чего не хватает в ответе пользователя, а что хорошо.\n"
+        f"Формат ответа:\nОценка: <проценты>%\nРекомендация: <текст>"
+    )
+    
+    try:
+        chat_completion = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=user_stats[user_id_str].get("model", DEFAULT_MODEL),
+        )
+        response = chat_completion.choices[0].message.content
+        response = remove_think_blocks(response)
+        
+        # Отправляем оценку и показываем клавиатуру экзамена
+        send_message_safe(chat_id, f"📝 Результат:\n\n{response}", get_exam_keyboard())
+        
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Ошибка при оценке ответа: {e}", reply_markup=get_exam_keyboard())
+
+def show_theory(user_id, chat_id):
+    """Показ теории по вопросу"""
+    user_id_str = str(user_id)
+    question = user_exam_state[user_id_str].get("question", "")
+    correct_answer = answers_data.get(question, "")
+    
+    theory_prompt = (
+        f"Ты — преподаватель информатики. На основе следующего экзаменационного вопроса и эталонного ответа "
+        f"составь компактный, но полный конспект по теме для подготовки к экзамену. "
+        f"Излагай структурировано с подзаголовками, списками и короткими примерами кода, где уместно.\n\n"
+        f"Вопрос: {question}\n"
+        f"Эталонный ответ: {correct_answer}\n\n"
+        f"Требования к структуре:\n"
+        f"1) Краткое введение в тему (1–2 предложения)\n"
+        f"2) Ключевые понятия и определения\n"
+        f"3) Основные приёмы/синтаксис/формулы (по теме)\n"
+        f"4) Короткие примеры (минимум 2)\n"
+        f"5) Частые ошибки и как их избегать\n"
+        f"6) Мини-чеклист перед экзаменом\n\n"
+        f"Выводи строго на русском языке. Заголовок: 'Теория по теме'."
+    )
+    
+    try:
+        theory_completion = client.chat.completions.create(
+            messages=[{"role": "user", "content": theory_prompt}],
+            model=user_stats[user_id_str].get("model", DEFAULT_MODEL),
+        )
+        theory = theory_completion.choices[0].message.content
+        theory = remove_think_blocks(theory)
+        
+        # Отправляем теорию частями
+        for part in split_message(theory):
+            send_message_safe(chat_id, part)
+            
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Ошибка при формировании теории: {e}")
+
+def next_question(user_id, chat_id):
+    """Следующий вопрос"""
+    user_id_str = str(user_id)
+    question = random.choice(list(answers_data.keys()))
+    user_exam_state[user_id_str] = {
+        "question": question,
+        "waiting_answer": True,
+        "start_time": time.time()
+    }
+    save_exam_state()
+    
+    bot.send_message(
+        chat_id,
+        f"📋 Следующий вопрос:\n\n{question}\n\n💬 Введите ваш ответ:",
+        reply_markup=get_hidden_keyboard()
+    )
+
+def end_exam(user_id, chat_id):
+    """Завершение экзамена"""
+    user_id_str = str(user_id)
+    user_exam_state.pop(user_id_str, None)
+    save_exam_state()
+    
+    bot.send_message(
+        chat_id,
+        "✅ Экзамен завершён!\n\nВы можете начать новый экзамен или использовать другие функции бота.",
+        reply_markup=get_main_keyboard()
+    )
+
+# ======================== ОБРАБОТЧИКИ КОМАНД ========================
+
+@bot.message_handler(commands=['start'])
+def cmd_start(message: Message):
+    user_id = message.from_user.id
+    initialize_user(user_id, message.from_user.__dict__)
+    
+    welcome_text = (
+        f"👋 Привет, {message.from_user.first_name}!\n\n"
+        f"Я ИИ-бот для подготовки к экзаменам по информатике.\n\n"
+        f"Что я умею:\n"
+        f"• 🎯 Проводить экзамены с оценкой ответов\n"
+        f"• 📖 Показывать теорию по темам\n"
+        f"• 🎤 Обрабатывать голосовые сообщения\n"
+        f"• 💬 Отвечать на вопросы\n\n"
+        f"Выберите действие на клавиатуре ниже!"
+    )
+    
+    send_message_safe(message.chat.id, welcome_text, get_main_keyboard())
+
+@bot.message_handler(commands=['help'])
+def cmd_help(message: Message):
+    help_text = (
+        "📖 Справка по командам:\n\n"
+        "🎯 `/exam` — начать экзамен\n"
+        "📊 `/settings` — статистика и настройки\n"
+        "🗑 `/clear` — очистить историю диалога\n"
+        "❌ `/cancel_exam` — отменить текущий экзамен\n\n"
+        "Или используйте кнопки на клавиатуре!"
+    )
+    bot.send_message(message.chat.id, help_text)
+
+@bot.message_handler(commands=['clear'])
+def cmd_clear(message: Message):
+    user_id = message.from_user.id
+    initialize_user(user_id, message.from_user.__dict__)
+    user_messages[str(user_id)] = []
+    save_data(USER_MESSAGES_FILE, user_messages)
+    bot.send_message(message.chat.id, '🗑 История диалога очищена!', reply_markup=get_main_keyboard())
+
+@bot.message_handler(commands=['settings'])
+def cmd_settings(message: Message):
+    user_id = message.from_user.id
+    initialize_user(user_id, message.from_user.__dict__)
+    stats = user_stats[str(user_id)]
+    
+    stats_text = (
+        f"📊 Ваша статистика:\n\n"
+        f"👤 Пользователь: {stats['username']}\n"
+        f"💬 Текстовые запросы: {stats['text_requests']}\n"
+        f"🎤 Голосовые запросы: {stats['voice_requests']}\n"
+        f"🧠 Модель ИИ: {stats.get('model', DEFAULT_MODEL)}\n"
+        f"📝 Экзаменационных ответов: {stats.get('exam_answered', 0)}"
+    )
+    
+    send_message_safe(message.chat.id, stats_text, get_main_keyboard())
+
+@bot.message_handler(commands=['exam'])
+def cmd_exam(message: Message):
+    user_id = message.from_user.id
+    initialize_user(user_id, message.from_user.__dict__)
+    start_exam(user_id, message.chat.id)
+
+@bot.message_handler(commands=['cancel_exam'])
+def cmd_cancel_exam(message: Message):
+    user_id = message.from_user.id
+    user_id_str = str(user_id)
+    
+    if user_id_str in user_exam_state:
+        user_exam_state.pop(user_id_str)
+        save_exam_state()
+        bot.send_message(message.chat.id, "❌ Экзамен отменен!", reply_markup=get_main_keyboard())
+    else:
+        bot.send_message(message.chat.id, "❌ У вас нет активного экзамена.", reply_markup=get_main_keyboard())
+
+# ======================== ОБРАБОТЧИК ТЕКСТА ========================
+
+@bot.message_handler(content_types=['text'])
+def handle_text(message: Message):
+    user_id = message.from_user.id
+    user_id_str = str(user_id)
+    text = message.text.strip()
+    
+    initialize_user(user_id, message.from_user.__dict__)
+    
+    # Обработка кнопок клавиатуры
+    if text == "📚 Начать экзамен":
+        start_exam(user_id, message.chat.id)
+        return
+    
+    elif text == "📊 Статистика":
+        cmd_settings(message)
+        return
+    
+    elif text == "🗑 Очистить историю":
+        cmd_clear(message)
+        return
+    
+    # Обработка экзамена
+    if user_id_str in user_exam_state:
+        exam_state = user_exam_state[user_id_str]
+        
+        # Если ждем ответ на вопрос
+        if exam_state.get("waiting_answer"):
+            process_exam_answer(user_id, message.chat.id, text)
+            return
+        
+        # Если ждем действие после ответа
+        elif exam_state.get("waiting_action"):
+            if text == "📖 Показать теорию":
+                show_theory(user_id, message.chat.id)
+                return
+            
+            elif text == "⏭️ Следующий вопрос":
+                next_question(user_id, message.chat.id)
+                return
+            
+            elif text == "❌ Завершить экзамен":
+                end_exam(user_id, message.chat.id)
+                return
+    
+    # Обычное общение с ИИ
+    user_stats[user_id_str]["text_requests"] += 1
+    save_data(USER_STATS_FILE, user_stats)
+    
+    sent_message = bot.send_message(message.chat.id, '🤔 Думаю...')
+    
+    # Сохраняем сообщение пользователя
+    new_message = {"role": "user", "content": text}
+    user_messages[user_id_str].append(new_message)
+    
+    # Обрезаем контекст
+    context = trim_context(user_messages[user_id_str])
+    
+    try:
+        # Запрос к ИИ
+        chat_completion = client.chat.completions.create(
+            messages=context,
+            model=user_stats[user_id_str].get("model", DEFAULT_MODEL),
+        )
+        
+        response = chat_completion.choices[0].message.content
+        response = remove_think_blocks(response)
+        
+        # Сохраняем ответ бота
+        bot_response = {"role": "assistant", "content": response}
+        user_messages[user_id_str].append(bot_response)
+        user_messages[user_id_str] = trim_context(user_messages[user_id_str])
+        save_data(USER_MESSAGES_FILE, user_messages)
+        
+        # Отправляем ответ
+        message_parts = split_message(response)
+        
+        # Редактируем первое сообщение
+        try:
+            bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=sent_message.message_id,
+                text=message_parts[0],
+                parse_mode='Markdown'
+            )
+        except:
+            bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=sent_message.message_id,
+                text=message_parts[0]
+            )
+        
+        # Отправляем остальные части
+        for part in message_parts[1:]:
+            send_message_safe(message.chat.id, part)
+            
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}\n\nИспользуйте /clear для сброса контекста.")
+
+# ======================== ОБРАБОТЧИК ГОЛОСА ========================
+
+@bot.message_handler(content_types=['voice'])
+def handle_voice(message: Message):
+    user_id = message.from_user.id
+    user_id_str = str(user_id)
+    
+    initialize_user(user_id, message.from_user.__dict__)
+    user_stats[user_id_str]["voice_requests"] += 1
+    save_data(USER_STATS_FILE, user_stats)
+    
+    try:
+        # Получаем и сохраняем аудио файл
+        file_info = bot.get_file(message.voice.file_id)
+        file_path = file_info.file_path
+        audio_file = bot.download_file(file_path)
+        audio_filename = f"{message.chat.id}_audio.ogg"
+        
+        with open(audio_filename, 'wb') as f:
+            f.write(audio_file)
+        
+        # Транскрипция
+        with open(audio_filename, 'rb') as audio:
+            transcription = client.audio.transcriptions.create(
+                file=(audio_filename, audio.read()),
+                model="whisper-large-v3-turbo",
+                response_format="json",
+                language="ru",
+                temperature=0.0
+            )
+        
+        os.remove(audio_filename)  # Удаляем временный файл
+        transcribed_text = transcription.text.strip()
+        
+        # Если в экзамене и ждем ответ
+        if user_id_str in user_exam_state and user_exam_state[user_id_str].get("waiting_answer"):
+            process_exam_answer(user_id, message.chat.id, transcribed_text)
+            return
+        
+        # Обычная обработка
+        bot.send_message(message.chat.id, f"🎤 Расшифровка: {transcribed_text}")
+        
+        # Сохраняем как обычное текстовое сообщение для контекста
+        new_message = {"role": "user", "content": f"[Голосовое сообщение]: {transcribed_text}"}
+        user_messages[user_id_str].append(new_message)
+        save_data(USER_MESSAGES_FILE, user_messages)
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка при обработке голосового сообщения: {e}")
+
+# ======================== ЗАПУСК ========================
+
+def set_commands():
+    """Установка команд бота"""
+    commands = [
+        BotCommand(command="start", description="Начать работу с ботом"),
+        BotCommand(command="help", description="Справка по командам"),
+        BotCommand(command="exam", description="Начать экзамен"),
+        BotCommand(command="settings", description="Статистика и настройки"),
+        BotCommand(command="clear", description="Очистить историю диалога"),
+        BotCommand(command="cancel_exam", description="Отменить экзамен"),
+    ]
+    bot.set_my_commands(commands)
+
+if __name__ == '__main__':
+    print("🚀 Загрузка данных...")
+    load_all_data()
+    print("📋 Установка команд...")
+    set_commands()
+    print("✅ Бот запущен и готов к работе!")
+    bot.polling(none_stop=True)
