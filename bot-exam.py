@@ -30,6 +30,19 @@ ANSWERS_FILE = "answers_python.json"
 EXAM_STATE_FILE = "exam_states.json"
 MAX_CONTEXT_LENGTH = 3000
 
+# Конфигурация тем экзамена
+EXAM_TOPICS = {
+    "Питон": {
+        "questions_file": "answers_python.json",
+        "display_name": "📱 Информатика"
+    },
+    "Текст": {
+        "questions_file": "answers_math.json", 
+        "display_name": "🔢 текст"
+    }
+}
+
+
 # Глобальные переменные
 user_messages = {}
 user_stats = {}
@@ -53,6 +66,21 @@ def save_data(filename, data):
 def save_exam_state():
     """Сохранение состояний экзамена"""
     save_data(EXAM_STATE_FILE, user_exam_state)
+
+def load_topic_data(topic_key):
+    """Загрузка данных для темы (возвращает словарь)"""
+    if topic_key in EXAM_TOPICS:
+        questions_file = EXAM_TOPICS[topic_key]["questions_file"]
+        return load_data(questions_file)
+    return {}
+
+def get_user_questions(user_id):
+    """Получить вопросы пользователя из состояния"""
+    user_id_str = str(user_id)
+    if user_id_str in user_exam_state:
+        return user_exam_state[user_id_str].get("questions", {})
+    return {}
+
 
 def split_message(text, max_length=4096):
     """Разбивка длинного сообщения на части"""
@@ -125,42 +153,75 @@ def load_all_data():
 
 # ======================== ЭКЗАМЕН ========================
 
-def start_exam(user_id, chat_id):
-    """Начало экзамена"""
+def get_topics_keyboard():
+    """Клавиатура для выбора темы экзамена"""
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    
+    # Добавляем темы по 2 в ряд
+    topics = list(EXAM_TOPICS.keys())
+    for i in range(0, len(topics), 2):
+        if i + 1 < len(topics):
+            keyboard.row(
+                KeyboardButton(EXAM_TOPICS[topics[i]]["display_name"]),
+                KeyboardButton(EXAM_TOPICS[topics[i+1]]["display_name"])
+            )
+        else:
+            keyboard.row(KeyboardButton(EXAM_TOPICS[topics[i]]["display_name"]))
+    
+    keyboard.row(KeyboardButton("🔙 Назад в меню"))
+    return keyboard
+
+def start_exam(user_id, chat_id, topic_key):
+    """Начало экзамена по выбранной теме"""
     user_id_str = str(user_id)
     
-    if not answers_data:
-        bot.send_message(chat_id, "❌ База вопросов пуста или не загружена.")
+    # Загружаем вопросы для темы
+    questions_data = load_topic_data(topic_key)
+    if not questions_data:
+        bot.send_message(chat_id, f"❌ Ошибка: База вопросов для темы '{EXAM_TOPICS[topic_key]['display_name']}' пуста или не найдена.", reply_markup=get_main_keyboard())
         return
     
-    question = random.choice(list(answers_data.keys()))
+    question = random.choice(list(questions_data.keys()))
+    
+    # Сохраняем ВСЕ вопросы в состоянии пользователя
     user_exam_state[user_id_str] = {
         "question": question,
         "waiting_answer": True,
-        "start_time": time.time()
+        "topic": topic_key,
+        "topic_display": EXAM_TOPICS[topic_key]["display_name"],
+        "start_time": time.time(),
+        "questions": questions_data  # 👈 Сохраняем все вопросы здесь!
     }
-    save_exam_state()
+    save_exam_state()  # Записываем в файл
     
     bot.send_message(
         chat_id,
-        f"🎯 Экзамен начат!\n\nВопрос:\n{question}\n\n💬 Введите ваш ответ:",
+        f"🎯 Экзамен начат!\n\n"
+        f"Тема: {EXAM_TOPICS[topic_key]['display_name']}\n"
+        f"Вопрос:\n{question}\n\n"
+        f"💬 Введите ваш ответ:",
         reply_markup=get_hidden_keyboard()
     )
+
 
 def process_exam_answer(user_id, chat_id, user_answer):
     """Обработка ответа на экзамен"""
     user_id_str = str(user_id)
     question = user_exam_state[user_id_str]["question"]
-    correct_answer = answers_data.get(question, "")
+    
+    # Берем правильный ответ из сохраненных вопросов пользователя
+    user_questions = get_user_questions(user_id)
+    correct_answer = user_questions.get(question, "")
     
     # Меняем состояние
     user_exam_state[user_id_str]["waiting_answer"] = False
     user_exam_state[user_id_str]["waiting_action"] = True
-    save_exam_state()
+    save_exam_state()  # Сохраняем изменения
     
     # Увеличиваем счетчик
     user_stats[user_id_str]["exam_answered"] = user_stats[user_id_str].get("exam_answered", 0) + 1
     save_data(USER_STATS_FILE, user_stats)
+
     
     # Оценка ответа
     prompt = (
@@ -190,7 +251,10 @@ def show_theory(user_id, chat_id):
     """Показ теории по вопросу"""
     user_id_str = str(user_id)
     question = user_exam_state[user_id_str].get("question", "")
-    correct_answer = answers_data.get(question, "")
+    
+    # Берем правильный ответ из сохраненных вопросов пользователя
+    user_questions = get_user_questions(user_id)
+    correct_answer = user_questions.get(question, "")
     
     theory_prompt = (
         f"Ты — преподаватель информатики. На основе следующего экзаменационного вопроса и эталонного ответа "
@@ -226,23 +290,36 @@ def show_theory(user_id, chat_id):
 def next_question(user_id, chat_id):
     """Следующий вопрос"""
     user_id_str = str(user_id)
-    question = random.choice(list(answers_data.keys()))
-    user_exam_state[user_id_str] = {
+    
+    # Берем вопросы из состояния пользователя
+    user_questions = get_user_questions(user_id)
+    if not user_questions:
+        bot.send_message(chat_id, "❌ Ошибка: Нет доступных вопросов.")
+        return
+    
+    question = random.choice(list(user_questions.keys()))
+    topic_display = user_exam_state[user_id_str]["topic_display"]
+    
+    # Обновляем состояние
+    user_exam_state[user_id_str].update({
         "question": question,
         "waiting_answer": True,
-        "start_time": time.time()
-    }
-    save_exam_state()
+        "waiting_action": False
+    })
+    save_exam_state()  # Сохраняем изменения
     
     bot.send_message(
         chat_id,
-        f"📋 Следующий вопрос:\n\n{question}\n\n💬 Введите ваш ответ:",
+        f"📋 Следующий вопрос ({topic_display}):\n\n{question}\n\n💬 Введите ваш ответ:",
         reply_markup=get_hidden_keyboard()
     )
+
 
 def end_exam(user_id, chat_id):
     """Завершение экзамена"""
     user_id_str = str(user_id)
+    
+    # Просто удаляем состояние - все данные автоматически исчезают
     user_exam_state.pop(user_id_str, None)
     save_exam_state()
     
@@ -251,6 +328,7 @@ def end_exam(user_id, chat_id):
         "✅ Экзамен завершён!\n\nВы можете начать новый экзамен или использовать другие функции бота.",
         reply_markup=get_main_keyboard()
     )
+
 
 # ======================== ОБРАБОТЧИКИ КОМАНД ========================
 
@@ -313,7 +391,34 @@ def cmd_settings(message: Message):
 def cmd_exam(message: Message):
     user_id = message.from_user.id
     initialize_user(user_id, message.from_user.__dict__)
-    start_exam(user_id, message.chat.id)
+    
+    user_id_str = str(user_id)
+    
+    # Проверяем активный экзамен
+    if user_id_str in user_exam_state and user_exam_state[user_id_str].get("waiting_answer"):
+        current_question = user_exam_state[user_id_str]["question"]
+        current_topic = user_exam_state[user_id_str].get("topic_display", "Неизвестно")
+        bot.send_message(
+            message.chat.id,
+            f"❗ У вас есть незавершенный экзамен!\n\n"
+            f"Тема: {current_topic}\n"
+            f"Вопрос: {current_question}\n\n"
+            f"💬 Введите ваш ответ или используйте /cancel_exam для отмены:",
+            reply_markup=get_hidden_keyboard()
+        )
+        return
+    
+    # Показываем выбор темы
+    user_exam_state[user_id_str] = {"waiting_topic": True}
+    save_exam_state()
+    
+    topics_text = "🎯 Выберите тему для экзамена:\n\n"
+    for topic_key, topic_data in EXAM_TOPICS.items():
+        questions_count = len(load_topic_data(topic_key))
+        topics_text += f"• {topic_data['display_name']} ({questions_count} вопросов)\n"
+    
+    send_message_safe(message.chat.id, topics_text, get_topics_keyboard())
+
 
 @bot.message_handler(commands=['cancel_exam'])
 def cmd_cancel_exam(message: Message):
@@ -336,10 +441,32 @@ def handle_text(message: Message):
     text = message.text.strip()
     
     initialize_user(user_id, message.from_user.__dict__)
+
+    # Обработка выбора темы
+    if user_id_str in user_exam_state and user_exam_state[user_id_str].get("waiting_topic"):
+        # Ищем тему по display_name
+        selected_topic = None
+        for topic_key, topic_data in EXAM_TOPICS.items():
+            if text == topic_data["display_name"]:
+                selected_topic = topic_key
+                break
+        
+        if selected_topic:
+            user_exam_state[user_id_str].pop("waiting_topic", None)
+            start_exam(user_id, message.chat.id, selected_topic)  # 👈 Теперь с topic_key!
+            return
+        elif text == "🔙 Назад в меню":
+            user_exam_state.pop(user_id_str, None)
+            save_exam_state()
+            send_message_safe(message.chat.id, "↩️ Возврат в главное меню", get_main_keyboard())
+            return
+        else:
+            bot.send_message(message.chat.id, "❌ Неверный выбор. Пожалуйста, выберите тему из предложенных:")
+            return
     
     # Обработка кнопок клавиатуры
     if text == "📚 Начать экзамен":
-        start_exam(user_id, message.chat.id)
+        cmd_exam(message)
         return
     
     elif text == "📊 Статистика":
