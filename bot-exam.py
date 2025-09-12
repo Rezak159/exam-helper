@@ -43,6 +43,10 @@ EXAM_TOPICS = {
     "clash royale": {
         "questions_file": "answers_royale.json", 
         "display_name": "Клещ рояль 🐞"
+    },
+    "bd_kollok": {
+        "questions_file": "bd_kollok.json", 
+        "display_name": "БД 🤵‍♂️"
     }
 }
 
@@ -145,7 +149,8 @@ def get_main_keyboard():
 def get_exam_keyboard():
     """Клавиатура для экзамена"""
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.row(KeyboardButton("📖 Показать теорию"))
+    keyboard.row(KeyboardButton("📚 Теория (классика)"))
+    keyboard.row(KeyboardButton("🔥 Теория (зумеры)"))
     keyboard.row(KeyboardButton("⏭️ Следующий вопрос"), KeyboardButton("❌ Завершить экзамен"))
     return keyboard
 
@@ -295,7 +300,7 @@ def start_exam(user_id, chat_id, topic_key):
         chat_id,
         f"🎯 Экзамен начат!\n\n"
         f"Тема: {EXAM_TOPICS[topic_key]['display_name']}\n"
-        f"Вопрос:\n{question}\n\n"
+        f"\n{question}\n\n"
         f"💬 Введите ваш ответ:",
         reply_markup=get_hidden_keyboard()
     )
@@ -334,7 +339,7 @@ def process_exam_answer(user_id, chat_id, user_answer):
     try:
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model=user_stats[user_id_str].get("model", DEFAULT_MODEL),
+            model=DEFAULT_MODEL,
         )
         response = chat_completion.choices[0].message.content
         response = remove_think_blocks(response)
@@ -353,7 +358,7 @@ def process_exam_answer(user_id, chat_id, user_answer):
     except Exception as e:
         bot.send_message(chat_id, f"❌ Ошибка при оценке ответа: {e}", reply_markup=get_exam_keyboard())
 
-def show_theory(user_id, chat_id):
+def show_theory(user_id, chat_id, theory_type="dry"):
     """Показ теории по вопросу"""
     user_id_str = str(user_id)
     question = user_exam_state[user_id_str].get("question", "")
@@ -361,30 +366,37 @@ def show_theory(user_id, chat_id):
     # Берем правильный ответ из сохраненных вопросов пользователя
     user_questions = get_user_questions(user_id)
     correct_answer = user_questions.get(question, "")
+
+    if theory_type == "dry":
+        theory_prompt = f"""Дай точное объяснение:
+            Вопрос: {question}
+            Правильный ответ: {correct_answer}
+            Строго по шаблону из правильного ответа."""
     
-    theory_prompt = (
-        f"Ты — преподаватель информатики. На основе следующего экзаменационного вопроса и эталонного ответа "
-        f"составь компактный, но полный конспект по теме для подготовки к экзамену. "
-        f"Излагай структурировано с подзаголовками, списками и короткими примерами кода, где уместно.\n\n"
-        f"Вопрос: {question}\n"
-        f"Эталонный ответ: {correct_answer}\n\n"
-        f"Требования к структуре:\n"
-        f"1) Краткое введение в тему (1–2 предложения)\n"
-        f"2) Ключевые понятия и определения\n"
-        f"3) Основные приёмы/синтаксис/формулы (по теме)\n"
-        f"4) Короткие примеры (минимум 2)\n"
-        f"5) Частые ошибки и как их избегать\n"
-        f"6) Мини-чеклист перед экзаменом\n\n"
-        f"Выводи строго на русском языке. Заголовок: 'Теория по теме'."
-    )
+    else:
+        theory_prompt = (
+            f"Ты — преподаватель информатики. На основе следующего экзаменационного вопроса и эталонного ответа "
+            f"составь компактный, но полный конспект по теме для подготовки к экзамену. "
+            f"Излагай структурировано с подзаголовками, списками и короткими примерами кода, где уместно.\n\n"
+            f"Вопрос: {question}\n"
+            f"Эталонный ответ: {correct_answer}\n\n"
+            f"Требования к структуре:\n"
+            f"1) Краткое введение в тему (1–2 предложения)\n"
+            f"2) Ключевые понятия и определения\n"
+            f"3) Основные приёмы/синтаксис/формулы (по теме)\n"
+            f"4) Короткие примеры (минимум 2)\n"
+            f"5) Частые ошибки и как их избегать\n"
+            f"6) Мини-чеклист перед экзаменом\n\n"
+            f"Выводи строго на русском языке. Заголовок: 'Теория по теме'."
+        )
     
     try:
         # Сообщаем пользователю, что идёт формирование теории
-        thinking_message = bot.send_message(chat_id, '🤔 Думаю над теорией...')
+        thinking_message = bot.send_message(chat_id, '🤔 Генерирую объяснение...')
 
         theory_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": theory_prompt}],
-            model=user_stats[user_id_str].get("model", DEFAULT_MODEL),
+            model=DEFAULT_MODEL,
         )
         theory = theory_completion.choices[0].message.content
         theory = remove_think_blocks(theory)
@@ -472,12 +484,12 @@ def cmd_start(message: Message):
     
     welcome_text = (
         f"👋 Привет, {message.from_user.first_name}!\n\n"
-        f"Я ИИ-бот для подготовки к экзаменам по информатике.\n\n"
+        f"Я ИИ-бот для подготовки к экзаменам.\n\n"
         f"Что я умею:\n"
-        f"• 🎯 Проводить экзамены с оценкой ответов\n"
-        f"• 📖 Показывать теорию по темам\n"
-        f"• 🎤 Обрабатывать голосовые сообщения\n"
-        f"• 💬 Отвечать на вопросы\n\n"
+        f"• 🎯 Оценивать ваши ответы на билеты с помощью ИИ\n"
+        f"• 📖 Показывать удобную теорию по темам\n"
+        f"• 💽 Умная система рекомендаций, сложные для вас темы попадаются чаще\n"
+        f"• 🎤 Обрабатываю голосовые\n\n"
         f"Выберите действие на клавиатуре ниже!"
     )
     
@@ -514,7 +526,7 @@ def cmd_settings(message: Message):
         f"👤 Пользователь: {stats['username']}\n"
         f"💬 Текстовые запросы: {stats['text_requests']}\n"
         f"🎤 Голосовые запросы: {stats['voice_requests']}\n"
-        f"🧠 Модель ИИ: {stats.get('model', DEFAULT_MODEL)}\n"
+        f"🧠 Модель ИИ: {DEFAULT_MODEL}\n"
         f"📝 Экзаменационных ответов: {stats.get('exam_answered', 0)}"
     )
     
@@ -535,7 +547,7 @@ def cmd_exam(message: Message):
             message.chat.id,
             f"❗ У вас есть незавершенный экзамен!\n\n"
             f"Тема: {current_topic}\n"
-            f"Вопрос: {current_question}\n\n"
+            f"{current_question}\n\n"
             f"💬 Введите ваш ответ или используйте /cancel_exam для отмены:",
             reply_markup=get_hidden_keyboard()
         )
@@ -620,11 +632,15 @@ def handle_text(message: Message):
             return
         
         # Если ждем действие после ответа
-        elif exam_state.get("waiting_action"):
-            if text == "📖 Показать теорию":
-                show_theory(user_id, message.chat.id)
+        elif exam_state.get("waiting_action"):            
+            if text == "📚 Теория (классика)":
+                show_theory(user_id, message.chat.id, "dry")
                 return
-            
+
+            elif text == "🔥 Теория (зумеры)":
+                show_theory(user_id, message.chat.id, "zoomers")
+                return
+
             elif text == "⏭️ Следующий вопрос":
                 next_question(user_id, message.chat.id)
                 return
@@ -650,7 +666,7 @@ def handle_text(message: Message):
         # Запрос к ИИ
         chat_completion = client.chat.completions.create(
             messages=context,
-            model=user_stats[user_id_str].get("model", DEFAULT_MODEL),
+            model=DEFAULT_MODEL,
         )
         
         response = chat_completion.choices[0].message.content
@@ -757,4 +773,12 @@ if __name__ == '__main__':
     print("📋 Установка команд...")
     set_commands()
     print("✅ Бот запущен и готов к работе!")
-    bot.polling(none_stop=True)
+
+    while True:
+        try:
+            bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        except Exception as e:
+            print(f"❌ Ошибка соединения: {e}")
+            print("🔄 Перезапуск через 5 секунд...")
+            time.sleep(5)
+            continue
