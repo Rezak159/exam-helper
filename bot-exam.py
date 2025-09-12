@@ -10,6 +10,7 @@ import logging
 import random
 import re
 import time
+import requests
 
 # Настройка логирования
 logging.basicConfig(level=logging.ERROR)
@@ -33,19 +34,19 @@ MAX_CONTEXT_LENGTH = 3000
 # Конфигурация тем экзамена
 EXAM_TOPICS = {
     "python": {
-        "questions_file": "answers_python.json",
+        "questions_file": "theory/answers_python.json",
         "display_name": "Питончик 🐍"
     },
     "Текст": {
-        "questions_file": "answers_graph.json", 
+        "questions_file": "theory/answers_graph.json", 
         "display_name": "текст 🔢"
     },
     "clash royale": {
-        "questions_file": "answers_royale.json", 
+        "questions_file": "theory/answers_royale.json", 
         "display_name": "Клещ рояль 🐞"
     },
     "bd_kollok": {
-        "questions_file": "bd_kollok.json", 
+        "questions_file": "theory/answers_bd_kollok.json", 
         "display_name": "БД 🤵‍♂️"
     }
 }
@@ -61,11 +62,33 @@ user_question_stats = {}
 # ======================== УТИЛИТЫ ========================
 
 def load_data(filename):
-    """Загрузка данных из JSON файла"""
-    if os.path.exists(filename):
+    """Загрузка данных из JSON файла с проверками"""
+    try:
+        if not os.path.exists(filename):
+            logger.warning(f"Файл не найден: {filename}")
+            return {}
+            
+        # Проверяем размер файла
+        if os.path.getsize(filename) == 0:
+            logger.warning(f"Файл пустой: {filename}")
+            return {}
+            
         with open(filename, "r", encoding='utf-8') as file:
-            return json.load(file)
-    return {}
+            content = file.read().strip()
+            if not content:
+                logger.warning(f"Файл содержит только пробелы: {filename}")
+                return {}
+                
+            # Пытаемся загрузить JSON
+            return json.loads(content)
+            
+    except json.JSONDecodeError as e:
+        logger.error(f"Некорректный JSON в файле {filename}: {e}")
+        return {}
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке {filename}: {e}")
+        return {}
+
 
 def save_data(filename, data):
     """Сохранение данных в JSON файл"""
@@ -87,7 +110,10 @@ def get_user_questions(user_id):
     """Получить вопросы пользователя из состояния"""
     user_id_str = str(user_id)
     if user_id_str in user_exam_state:
-        return user_exam_state[user_id_str].get("questions", {})
+        # Возвращаем только текущий вопрос и ответ
+        question = user_exam_state[user_id_str].get("question", "")
+        answer = user_exam_state[user_id_str].get("correct_answer", "")
+        return {question: answer}
     return {}
 
 
@@ -105,7 +131,7 @@ def trim_context(context):
 
 def remove_think_blocks(text):
     """Удаление блоков размышлений модели"""
-    return re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
+    return re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE | re.DOTALL)
 
 def send_message_safe(chat_id, text, markup=None):
     """Безопасная отправка сообщения"""
@@ -136,6 +162,40 @@ def parse_ai_score(ai_response):
             return score
             
     return None
+
+def correct_transcription(text: str) -> str:
+    """Исправляет ошибки транскрибации с помощью ИИ"""
+    
+    # Если текст слишком короткий, не исправляем
+    if len(text.strip()) < 5:
+        return text
+    
+    prompt = f"""
+        Ты — эксперт по исправлению ошибок распознавания речи.
+        ЗАДАЧА: Исправь ошибки в тексте, сохраняя смысл и стиль автора.
+
+        ПРАВИЛА:
+        1. Если сомневаешься — оставляй как есть
+        2. Отвечай ТОЛЬКО исправленным текстом без комментариев
+
+        ИСХОДНЫЙ ТЕКСТ: {text}
+
+        ИСПРАВЛЕННЫЙ ТЕКСТ:"""
+
+    try:
+        response = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model='meta-llama/llama-4-maverick-17b-128e-instruct',
+            temperature=0.1,
+        )
+        
+        corrected_text = response.choices[0].message.content.strip()
+        return corrected_text
+        
+    except Exception as e:
+        logger.error(f"Ошибка исправления транскрибации: {e}")
+        return text  # Возвращаем исходный текст при ошибке
+
 
 # ======================== КЛАВИАТУРЫ ========================
 
@@ -274,27 +334,27 @@ def get_topics_keyboard():
     return keyboard
 
 def start_exam(user_id, chat_id, topic_key):
-    """Начало экзамена по выбранной теме"""
     user_id_str = str(user_id)
     
-    # Загружаем вопросы для темы
     questions_data = load_topic_data(topic_key)
     if not questions_data:
-        bot.send_message(chat_id, f"❌ Ошибка: База вопросов для темы '{EXAM_TOPICS[topic_key]['display_name']}' пуста или не найдена.", reply_markup=get_main_keyboard())
+        bot.send_message(chat_id, f"❌ Нет вопросов для темы '{EXAM_TOPICS[topic_key]['display_name']}'.", reply_markup=get_main_keyboard())
         return
     
     question = random.choice(list(questions_data.keys()))
+    correct_answer = questions_data[question]
     
-    # Сохраняем ВСЕ вопросы в состоянии пользователя
+    # Сохраняем только текущий вопрос и ответ!
     user_exam_state[user_id_str] = {
         "question": question,
+        "correct_answer": correct_answer,  # ← Только нужный ответ
         "waiting_answer": True,
         "topic": topic_key,
         "topic_display": EXAM_TOPICS[topic_key]["display_name"],
         "start_time": time.time(),
-        "questions": questions_data  # 👈 Сохраняем все вопросы здесь!
+        # questions: questions_data  # ← УБИРАЕМ ЭТО!
     }
-    save_exam_state()  # Записываем в файл
+    save_exam_state()
     
     bot.send_message(
         chat_id,
@@ -327,6 +387,8 @@ def process_exam_answer(user_id, chat_id, user_answer):
 
     
     # Оценка ответа
+
+    '''
     prompt = (
         f"Вопрос: {question}\n"
         f"Эталонный ответ (образец): {correct_answer}\n"
@@ -335,6 +397,31 @@ def process_exam_answer(user_id, chat_id, user_answer):
         f"Кратко укажи, взяв из эталона, чего не хватает в ответе пользователя, а что хорошо.\n"
         f"Формат ответа:\nОценка: <проценты>%\nРекомендация: <текст>"
     )
+    '''
+
+    prompt = f"""
+        ВОПРОС: {question}
+        ПРАВИЛЬНЫЙ ОТВЕТ (эталон): {correct_answer}
+        ОТВЕТ СТУДЕНТА: {user_answer}
+
+        КРИТЕРИИ ОЦЕНКИ:
+        0-15%: Полностью неверный ответ – не относится к вопросу, только тема без объяснений, бессмысленный набор слов.
+        16-35%: Минимальное понимание – упоминается тема, но нет объяснений, 1-2 правильных факта.
+        36-55%: Частичное понимание – основная идея есть, детали неточные, 30-50% ключевых моментов, несколько ошибок.
+        56-75%: Хорошее понимание – большинство ключевых моментов раскрыты, логичная структура, минимум ошибок.
+        76-90%: Отличное понимание – тема раскрыта полностью, основные и дополнительные детали, четкая логика.
+        91-100%: Превосходное знание – исчерпывающий ответ, дополнительные примеры, глубокое понимание.
+
+        ВАЖНО:
+        - Сравнивай только с эталонным ответом.
+        - Не завышай оценку за общие фразы.
+        - Учитывай полноту и точность.
+        - Оцени в процентах (0-100).
+
+        Отвечай строго в формате:
+        Оценка: <число>%
+        Рекомендация: <краткий анализ, что в ответе отсутствует и что хорошо, используя информацию из эталона>."""
+
     
     try:
         chat_completion = client.chat.completions.create(
@@ -584,6 +671,9 @@ def handle_text(message: Message):
     user_id = message.from_user.id
     user_id_str = str(user_id)
     text = message.text.strip()
+
+    if not text:
+        return
     
     initialize_user(user_id, message.from_user.__dict__)
 
@@ -710,48 +800,83 @@ def handle_voice(message: Message):
     user_id = message.from_user.id
     user_id_str = str(user_id)
     
+    # Инициализация пользователя
     initialize_user(user_id, message.from_user.__dict__)
+
+    if message.voice.file_size > 10 * 1024 * 1024:  # 10MB
+        bot.send_message(message.chat.id, "❌ Файл слишком большой")
+        return
+
     user_stats[user_id_str]["voice_requests"] += 1
     save_data(USER_STATS_FILE, user_stats)
-    
+
     try:
-        # Получаем и сохраняем аудио файл
-        file_info = bot.get_file(message.voice.file_id)
-        file_path = file_info.file_path
-        audio_file = bot.download_file(file_path)
-        audio_filename = f"{message.chat.id}_audio.ogg"
+        # Получаем информацию о голосовом файле
+        voice_file_info = bot.get_file(message.voice.file_id)
+        voice_file = requests.get(f'https://api.telegram.org/file/bot{TOKEN_TG}/{voice_file_info.file_path}')
         
-        with open(audio_filename, 'wb') as f:
-            f.write(audio_file)
-        
-        # Транскрипция
-        with open(audio_filename, 'rb') as audio:
+        # Сохраняем временно
+        voice_filename = f"voice_{user_id}_{int(time.time())}.ogg"
+        with open(voice_filename, 'wb') as f:
+            f.write(voice_file.content)
+
+        # Конвертируем в WAV для лучшего распознавания
+        wav_filename = voice_filename.replace('.ogg', '.wav')
+        os.system(f"ffmpeg -i {voice_filename} -ar 16000 -ac 1 -hide_banner -loglevel error {wav_filename}")
+
+        # Транскрибируем
+        with open(wav_filename, 'rb') as f:
             transcription = client.audio.transcriptions.create(
-                file=(audio_filename, audio.read()),
-                model="whisper-large-v3-turbo",
-                response_format="json",
-                language="ru",
-                temperature=0.0
+                model="whisper-large-v3",
+                file=f,
+                language="ru"
             )
-        
-        os.remove(audio_filename)  # Удаляем временный файл
+
+        # Удаляем временные файлы
+        os.remove(voice_filename)
+        os.remove(wav_filename)
+
         transcribed_text = transcription.text.strip()
         
-        # Если в экзамене и ждем ответ
-        if user_id_str in user_exam_state and user_exam_state[user_id_str].get("waiting_answer"):
-            process_exam_answer(user_id, message.chat.id, transcribed_text)
+        if not transcribed_text:
+            bot.send_message(message.chat.id, "❌ Не удалось распознать речь. Попробуйте еще раз.")
             return
-        
-        # Обычная обработка
-        bot.send_message(message.chat.id, f"🎤 Расшифровка: {transcribed_text}")
-        
-        # Сохраняем как обычное текстовое сообщение для контекста
-        new_message = {"role": "user", "content": f"[Голосовое сообщение]: {transcribed_text}"}
-        user_messages[user_id_str].append(new_message)
-        save_data(USER_MESSAGES_FILE, user_messages)
-        
+
+        # ИСПРАВЛЯЕМ ОШИБКИ ТРАНСКРИБАЦИИ ДЛЯ ВСЕХ СООБЩЕНИЙ
+        corrected_text = correct_transcription(transcribed_text)
+
+        if user_id_str in user_exam_state and user_exam_state[user_id_str].get("waiting_answer"):
+            process_exam_answer(user_id, message.chat.id, corrected_text)
+            return
+
+        # Показываем пользователю что было исправлено (если есть изменения)
+        if corrected_text != transcribed_text and len(transcribed_text) > 10:
+            bot.send_message(
+                message.chat.id, 
+                f"🎤 Распознано: {transcribed_text}\n✅ Исправлено: {corrected_text}",
+                parse_mode="Markdown"
+            )
+
+        # ЭКЗАМЕН: обработка ответа с исправленным текстом
+        if user_id_str in user_exam_state and user_exam_state[user_id_str].get("waiting_answer"):
+            process_exam_answer(user_id, message.chat.id, corrected_text)
+            return
+
+        # ОБЫЧНОЕ ОБЩЕНИЕ: создаем виртуальное текстовое сообщение
+        # Создаем объект сообщения с исправленным текстом
+        virtual_message = type('Message', (), {})()
+        virtual_message.text = corrected_text
+        virtual_message.from_user = message.from_user  
+        virtual_message.chat = message.chat
+        virtual_message.message_id = message.message_id
+
+        # Обрабатываем как обычное текстовое сообщение
+        handle_text(virtual_message)
+
     except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Ошибка при обработке голосового сообщения: {e}")
+        bot.send_message(message.chat.id, f"❌ Ошибка обработки голосового сообщения: {str(e)}")
+        logger.error(f"Ошибка в handle_voice: {e}")
+
 
 # ======================== ЗАПУСК ========================
 
