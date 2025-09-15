@@ -37,17 +37,21 @@ EXAM_TOPICS = {
         "questions_file": "theory/answers_python.json",
         "display_name": "Питончик 🐍"
     },
-    "Текст": {
+    "graph": {
         "questions_file": "theory/answers_graph.json", 
-        "display_name": "текст 🔢"
+        "display_name": "Графы 🔢"
     },
-    "clash royale": {
+    "clash_royale": {
         "questions_file": "theory/answers_royale.json", 
         "display_name": "Клещ рояль 🐞"
     },
     "bd_kollok": {
         "questions_file": "theory/answers_bd_kollok.json", 
         "display_name": "БД 🤵‍♂️"
+    },
+    "regular": {
+        "questions_file": "theory/answers_regular.json", 
+        "display_name": "Регулярки 🍕"
     }
 }
 
@@ -58,6 +62,8 @@ user_stats = {}
 answers_data = {}
 user_exam_state = {}
 user_question_stats = {}
+
+topic_cache = {}
 
 # ======================== УТИЛИТЫ ========================
 
@@ -100,10 +106,15 @@ def save_exam_state():
     save_data(EXAM_STATE_FILE, user_exam_state)
 
 def load_topic_data(topic_key):
-    """Загрузка данных для темы (возвращает словарь)"""
+    """Загрузка данных для темы с кэшированием"""
+    if topic_key in topic_cache:
+        return topic_cache[topic_key]
+    
     if topic_key in EXAM_TOPICS:
         questions_file = EXAM_TOPICS[topic_key]["questions_file"]
-        return load_data(questions_file)
+        data = load_data(questions_file)
+        topic_cache[topic_key] = data  # Кэшируем
+        return data
     return {}
 
 def get_user_questions(user_id):
@@ -458,13 +469,13 @@ def show_theory(user_id, chat_id, theory_type="dry"):
         theory_prompt = f"""Дай точное объяснение:
             Вопрос: {question}
             Правильный ответ: {correct_answer}
-            Строго по шаблону из правильного ответа."""
+            Строго по шаблону из правильного ответа. Не использовать **жирный шрифт**."""
     
     else:
         theory_prompt = (
             f"Ты — преподаватель информатики. На основе следующего экзаменационного вопроса и эталонного ответа "
             f"составь компактный, но полный конспект по теме для подготовки к экзамену. "
-            f"Излагай структурировано с подзаголовками, списками и короткими примерами кода, где уместно.\n\n"
+            f"Излагай структурировано с подзаголовками, списками и короткими примерами кода, где уместно. Не использовать **жирный шрифт**.\n\n"
             f"Вопрос: {question}\n"
             f"Эталонный ответ: {correct_answer}\n\n"
             f"Требования к структуре:\n"
@@ -523,18 +534,20 @@ def next_question(user_id, chat_id):
     user_id_str = str(user_id)
     topic_key = user_exam_state[user_id_str]["topic"]
     
-    # Берем вопросы из состояния пользователя
-    user_questions = get_user_questions(user_id)
-    if not user_questions:
+    # Берем Все вопросы темы
+    all_questions = load_topic_data(topic_key)
+    if not all_questions:
         bot.send_message(chat_id, "❌ Ошибка: Нет доступных вопросов.")
         return
     
-    question = select_adaptive_question(user_id, topic_key, user_questions)
+    question = select_adaptive_question(user_id, topic_key, all_questions)
+    correct_answer = all_questions[question]
     topic_display = user_exam_state[user_id_str]["topic_display"]
     
     # Обновляем состояние
     user_exam_state[user_id_str].update({
         "question": question,
+        "correct_answer": correct_answer,
         "waiting_answer": True,
         "waiting_action": False
     })
@@ -800,7 +813,6 @@ def handle_voice(message: Message):
     user_id = message.from_user.id
     user_id_str = str(user_id)
     
-    # Инициализация пользователя
     initialize_user(user_id, message.from_user.__dict__)
 
     if message.voice.file_size > 10 * 1024 * 1024:  # 10MB
@@ -820,12 +832,8 @@ def handle_voice(message: Message):
         with open(voice_filename, 'wb') as f:
             f.write(voice_file.content)
 
-        # Конвертируем в WAV для лучшего распознавания
-        wav_filename = voice_filename.replace('.ogg', '.wav')
-        os.system(f"ffmpeg -i {voice_filename} -ar 16000 -ac 1 -hide_banner -loglevel error {wav_filename}")
-
         # Транскрибируем
-        with open(wav_filename, 'rb') as f:
+        with open(voice_filename, 'rb') as f:
             transcription = client.audio.transcriptions.create(
                 model="whisper-large-v3",
                 file=f,
@@ -834,7 +842,6 @@ def handle_voice(message: Message):
 
         # Удаляем временные файлы
         os.remove(voice_filename)
-        os.remove(wav_filename)
 
         transcribed_text = transcription.text.strip()
         
@@ -842,7 +849,7 @@ def handle_voice(message: Message):
             bot.send_message(message.chat.id, "❌ Не удалось распознать речь. Попробуйте еще раз.")
             return
 
-        # ИСПРАВЛЯЕМ ОШИБКИ ТРАНСКРИБАЦИИ ДЛЯ ВСЕХ СООБЩЕНИЙ
+        # Исправление транскрипции и дальнейшая обработка
         corrected_text = correct_transcription(transcribed_text)
 
         if user_id_str in user_exam_state and user_exam_state[user_id_str].get("waiting_answer"):
@@ -862,13 +869,13 @@ def handle_voice(message: Message):
             process_exam_answer(user_id, message.chat.id, corrected_text)
             return
 
-        # ОБЫЧНОЕ ОБЩЕНИЕ: создаем виртуальное текстовое сообщение
-        # Создаем объект сообщения с исправленным текстом
-        virtual_message = type('Message', (), {})()
-        virtual_message.text = corrected_text
-        virtual_message.from_user = message.from_user  
-        virtual_message.chat = message.chat
-        virtual_message.message_id = message.message_id
+        # Создаем виртуальное сообщение и передаем в handle_text
+        virtual_message = type('obj', (object,), {
+            'text': corrected_text,
+            'from_user': message.from_user,
+            'chat': message.chat,
+            'message_id': message.message_id
+        })()
 
         # Обрабатываем как обычное текстовое сообщение
         handle_text(virtual_message)
