@@ -356,7 +356,14 @@ def start_exam(user_id, chat_id, topic_key):
         bot.send_message(chat_id, f"❌ Нет вопросов для темы '{EXAM_TOPICS[topic_key]['display_name']}'.", reply_markup=get_main_keyboard())
         return
     
-    question = random.choice(list(questions_data.keys()))
+    # question = random.choice(list(questions_data.keys()))
+
+    all_questions = load_topic_data(topic_key)
+    if not all_questions:
+        bot.send_message(chat_id, "❌ Ошибка: Нет доступных вопросов.")
+        return
+    
+    question = select_adaptive_question(user_id, topic_key, all_questions)
     correct_answer = questions_data[question]
     
     # Сохраняем только текущий вопрос и ответ!
@@ -370,11 +377,14 @@ def start_exam(user_id, chat_id, topic_key):
         # questions: questions_data  # ← УБИРАЕМ ЭТО!
     }
     save_exam_state()
+
+    score = get_average_score(user_id, topic_key, question)
     
     bot.send_message(
         chat_id,
         f"🎯 Экзамен начат!\n\n"
         f"Тема: {EXAM_TOPICS[topic_key]['display_name']}\n"
+        f"Средний балл: {round(score)}%\n"
         f"\n{question}\n\n"
         f"💬 Введите ваш ответ:",
         reply_markup=get_hidden_keyboard()
@@ -559,10 +569,12 @@ def next_question(user_id, chat_id):
         "waiting_action": False
     })
     save_exam_state()  # Сохраняем изменения
+
+    score = get_average_score(user_id, topic_key, question)
     
     bot.send_message(
         chat_id,
-        f"📋 Следующий вопрос ({topic_display}):\n\n{question}\n\n💬 Введите ваш ответ:",
+        f"📋 Следующий вопрос ({topic_display}):\nСредний балл: {round(score)}%\n\n{question}\n\n💬 Введите ваш ответ:",
         reply_markup=get_hidden_keyboard()
     )
 
